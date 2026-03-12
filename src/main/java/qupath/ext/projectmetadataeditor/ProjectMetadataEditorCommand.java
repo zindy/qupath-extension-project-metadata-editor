@@ -29,8 +29,12 @@ import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.net.URI;
+import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,7 +48,9 @@ import java.util.TreeSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javafx.application.Platform;
 import javafx.beans.binding.Bindings;
+import javafx.collections.FXCollections;
 import javafx.beans.binding.BooleanBinding;
 import javafx.beans.property.SimpleIntegerProperty;
 import javafx.beans.value.ObservableStringValue;
@@ -72,11 +78,16 @@ import javafx.scene.input.KeyCombination;
 import javafx.scene.input.KeyEvent;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.HBox;
+import javafx.scene.layout.Priority;
+import javafx.scene.control.Label;
+import javafx.scene.control.TextField;
+import javafx.scene.control.Tooltip;
 import javafx.stage.FileChooser;
 import javafx.stage.FileChooser.ExtensionFilter;
 import qupath.fx.dialogs.Dialogs;
 import qupath.lib.gui.QuPathGUI;
 import qupath.lib.gui.panes.ProjectBrowser;
+import qupath.lib.gui.panes.ProjectEntryPredicate;
 import qupath.lib.gui.prefs.SystemMenuBar;
 import qupath.lib.projects.Project;
 import qupath.lib.projects.ProjectImageEntry;
@@ -86,7 +97,7 @@ import qupath.lib.projects.ProjectImageEntry;
  * <p>
  * Features:
  * <ul>
- *   <li>File menu + toolbar buttons: Import CSV/TSV, Export (TSV / comma CSV / semicolon CSV)</li>
+ *   <li>File menu: Import CSV/TSV, Export (TSV / comma CSV / semicolon CSV — format chosen in save dialog)</li>
  *   <li>Edit: Undo / Redo for all cell changes</li>
  *   <li>Edit: Add and Remove metadata columns</li>
  *   <li>Edit: Excel-compatible multi-cell Copy / Paste</li>
@@ -140,13 +151,30 @@ public class ProjectMetadataEditorCommand {
         colIndex.setCellValueFactory(v -> v.getValue().indexProperty);
         colIndex.setPrefWidth(40);
         colIndex.setEditable(false);
-        colIndex.setSortable(false);
+        colIndex.setSortable(true);
         table.getColumns().add(colIndex);
 
         TableColumn<ImageEntryWrapper, String> colName = new TableColumn<>(IMAGE_NAME);
         colName.setCellValueFactory(v -> v.getValue().getNameBinding());
         colName.setEditable(false);
         table.getColumns().add(colName);
+
+        // Clicking # resets rows to natural (project) order and clears any sort arrow.
+        // All other column sorts use JavaFX's built-in combined comparator unchanged.
+        table.setSortPolicy(t -> {
+            var order = t.getSortOrder();
+            if (order.size() == 1 && order.get(0) == colIndex) {
+                t.getItems().sort(Comparator.comparingInt(w -> w.indexProperty.get()));
+                Platform.runLater(order::clear); // clears the sort arrow after rendering
+            } else if (t.getComparator() != null) {
+                // Guard against null comparator: the runLater above fires a second
+                // sort event with an empty sort order, which would make getComparator()
+                // return null and cause FXCollections.sort() to attempt natural ordering
+                // (which crashes because ImageEntryWrapper does not implement Comparable).
+                FXCollections.sort(t.getItems(), t.getComparator());
+            }
+            return true;
+        });
 
         // Undo/Redo menu items — created early so EditorContext can hold them
         MenuItem miUndo = new MenuItem("Undo");
@@ -217,6 +245,15 @@ public class ProjectMetadataEditorCommand {
         MenuItem miRemoveCol = new MenuItem("Remove column\u2026");
         miRemoveCol.setOnAction(e -> removeColumn(table, entries, context));
 
+        MenuItem miAddPathFileCols = new MenuItem("Add PathName \u0026 FileName columns");
+        miAddPathFileCols.setOnAction(e -> addPathNameFileNameColumns(table, entries, context));
+
+        MenuItem miCopyCol = new MenuItem("Copy column\u2026");
+        miCopyCol.setOnAction(e -> copyColumn(table, entries, context));
+
+        MenuItem miRenameCol = new MenuItem("Rename column\u2026");
+        miRenameCol.setOnAction(e -> renameColumn(table, entries, context));
+
         MenuItem miCopy = new MenuItem("Copy");
         miCopy.disableProperty().bind(noSelection);
         miCopy.setAccelerator(new KeyCodeCombination(KeyCode.C, KeyCombination.SHORTCUT_DOWN));
@@ -237,48 +274,67 @@ public class ProjectMetadataEditorCommand {
             applyBatchChange(table.getSelectionModel().getSelectedCells(), input, context);
         });
 
+        MenuItem miSearchReplace = new MenuItem("Search & Replace\u2026");
+        miSearchReplace.setAccelerator(new KeyCodeCombination(KeyCode.H, KeyCombination.SHORTCUT_DOWN));
+        miSearchReplace.setOnAction(e -> showSearchReplaceDialog(table, context));
+
         menuEdit.getItems().addAll(
                 miUndo, miRedo,
                 new SeparatorMenuItem(),
-                miAddCol, miRemoveCol,
+                miAddCol, miRemoveCol, miCopyCol, miRenameCol, miAddPathFileCols,
                 new SeparatorMenuItem(),
                 miCopy, miCopyFull, miPaste,
                 new SeparatorMenuItem(),
-                miSetCells
+                miSetCells,
+                miSearchReplace
         );
 
         menubar.getMenus().addAll(menuFile, menuEdit);
         SystemMenuBar.manageChildMenuBar(menubar);
 
         // =====================================================================
-        // IMPORT / EXPORT TOOLBAR BUTTONS (below the table)
+        // FILTER BAR (above the table)
         // =====================================================================
-        Button btnImport = new Button("Import\u2026");
-        btnImport.setOnAction(e -> importCsv(table, entries, context));
-        btnImport.setTooltip(new javafx.scene.control.Tooltip(
-                "Import metadata from a CSV or TSV file"));
+        //
+        // Filtering is display-only: `entries` (the full list) always remains the
+        // source of truth for Save, Undo/Redo, Remove Column, etc.
+        // ProjectEntryPredicate.createIgnoreCase() searches image name AND all
+        // metadata values so the user can filter on either.
+        Label lblFilter = new Label("Filter:");
+        TextField tfFilter = new TextField();
+        tfFilter.setPromptText("Image name or metadata\u2026");
+        tfFilter.setTooltip(new Tooltip(
+                "Filter rows by image name or any metadata value (case-insensitive).\n"
+                + "Hidden rows are not deleted \u2014 clear the filter to show all images."));
+        HBox.setHgrow(tfFilter, Priority.ALWAYS);
 
-        // Export button opens a small popup menu so the user can pick the format
-        Button btnExport = new Button("Export\u2026");
-        btnExport.setTooltip(new javafx.scene.control.Tooltip(
-                "Export metadata to a CSV or TSV file"));
-        btnExport.setOnAction(e -> {
-            // Reuse the same FileChooser-based flow; let the user choose the format
-            // via extension filters in the save dialog.
-            exportCsvInteractive(table);
-        });
+        Button btnClearFilter = new Button("\u2715");
+        btnClearFilter.setTooltip(new Tooltip("Clear filter"));
+        btnClearFilter.visibleProperty().bind(tfFilter.textProperty().isNotEmpty());
+        btnClearFilter.managedProperty().bind(tfFilter.textProperty().isNotEmpty());
+        btnClearFilter.setOnAction(e -> tfFilter.clear());
 
-        HBox toolbar = new HBox(8, btnImport, btnExport);
-        toolbar.setAlignment(Pos.CENTER_LEFT);
-        toolbar.setPadding(new Insets(4, 4, 4, 4));
+        // Status label: "Showing X of Y" only while a filter is active
+        Label lblFilterStatus = new Label();
+        lblFilterStatus.setStyle("-fx-text-fill: -fx-accent; -fx-font-size: 0.9em;");
+
+        HBox filterBar = new HBox(6, lblFilter, tfFilter, btnClearFilter, lblFilterStatus);
+        filterBar.setAlignment(Pos.CENTER_LEFT);
+        filterBar.setPadding(new Insets(2, 4, 2, 4));
+
+        // Rebuild table.getItems() on every keystroke
+        tfFilter.textProperty().addListener((obs, oldText, newText) ->
+                applyEntryFilter(newText, entries, table, lblFilterStatus));
 
         // =====================================================================
         // LAYOUT & DIALOG
         // =====================================================================
+        // Import and Export are accessed from the File menu.
+        // The filter bar sits directly below the table.
         BorderPane pane = new BorderPane();
         pane.setTop(menubar);
         pane.setCenter(table);
-        pane.setBottom(toolbar);
+        pane.setBottom(filterBar);
 
         Dialog<ButtonType> dialog = new Dialog<>();
         var qupath = QuPathGUI.getInstance();
@@ -538,7 +594,7 @@ public class ProjectMetadataEditorCommand {
 
     /**
      * Exports with a single FileChooser that offers all three format choices
-     * via extension filters.  Called from the toolbar Export button.
+     * via extension filters.  Called from the File > Export menu.
      */
     private static void exportCsvInteractive(TableView<ImageEntryWrapper> table) {
         FileChooser chooser = new FileChooser();
@@ -662,6 +718,7 @@ public class ProjectMetadataEditorCommand {
         addTableColumn(table, newKey, context);
     }
 
+    @SuppressWarnings("unchecked")
     private static void removeColumn(TableView<ImageEntryWrapper> table,
                                      List<ImageEntryWrapper> entries,
                                      EditorContext context) {
@@ -684,21 +741,381 @@ public class ProjectMetadataEditorCommand {
                 "Remove column '" + key + "' and clear its values from all entries?"))
             return;
 
-        // Record clearing as undoable edit
-        MetadataEdit batchEdit = new MetadataEdit();
-        for (ImageEntryWrapper wrapper : entries) {
-            String oldVal = wrapper.getMetadataValue(key);
-            if (oldVal != null)
-                batchEdit.addChange(wrapper, key, oldVal, null);
-        }
-        if (!batchEdit.isEmpty())
-            context.execute(batchEdit);
+        TableColumn<ImageEntryWrapper, String> col = (TableColumn<ImageEntryWrapper, String>)
+                table.getColumns().stream().filter(c -> key.equals(c.getText())).findFirst().orElse(null);
+        if (col == null) return;
 
-        table.getColumns().removeIf(col -> key.equals(col.getText()));
+        context.execute(new ColumnRemoveEdit(table, col, entries));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void copyColumn(TableView<ImageEntryWrapper> table,
+                                    List<ImageEntryWrapper> entries,
+                                    EditorContext context) {
+        List<String> copyable = new ArrayList<>();
+        for (TableColumn<ImageEntryWrapper, ?> col : table.getColumns()) {
+            String h = col.getText();
+            if (!INDEX.equals(h) && !IMAGE_NAME.equals(h))
+                copyable.add(h);
+        }
+        if (copyable.isEmpty()) {
+            Dialogs.showInfoNotification("Copy column", "No metadata columns to copy.");
+            return;
+        }
+
+        // ---- Single dialog: source dropdown + destination text field --------
+        javafx.scene.control.ComboBox<String> cboSource = new javafx.scene.control.ComboBox<>();
+        cboSource.getItems().setAll(copyable);
+        // Pre-select whichever column the user has focused in the table
+        String focusedCopy = focusedColumnName(table, copyable);
+        cboSource.setValue(focusedCopy != null ? focusedCopy : copyable.get(0));
+
+        TextField tfNewName = new TextField();
+        tfNewName.setPromptText("New column name");
+
+        // Auto-suggest "<source>_copy" whenever the source selection changes,
+        // but only while the user hasn't typed anything of their own yet.
+        cboSource.valueProperty().addListener((obs, oldSrc, newSrc) -> {
+            String current = tfNewName.getText().trim();
+            if (current.isEmpty() || (oldSrc != null && current.equals(oldSrc + "_copy")))
+                tfNewName.setText(newSrc + "_copy");
+        });
+        tfNewName.setText(cboSource.getValue() + "_copy");
+
+        // Error label shown inline when name is duplicate — dialog stays open
+        Label lblError = new Label();
+        lblError.setStyle("-fx-text-fill: -fx-error; -fx-font-size: 0.9em;");
+        lblError.setVisible(false);
+        // Clear error as soon as the user edits the name
+        tfNewName.textProperty().addListener((obs, o, n) -> lblError.setVisible(false));
+
+        javafx.scene.layout.GridPane grid = new javafx.scene.layout.GridPane();
+        grid.setHgap(10);
+        grid.setVgap(8);
+        grid.setPadding(new Insets(12, 16, 4, 16));
+        javafx.scene.layout.ColumnConstraints ccLabel = new javafx.scene.layout.ColumnConstraints();
+        ccLabel.setMinWidth(javafx.scene.layout.Region.USE_PREF_SIZE);
+        javafx.scene.layout.ColumnConstraints ccField = new javafx.scene.layout.ColumnConstraints();
+        ccField.setHgrow(Priority.ALWAYS);
+        ccField.setMinWidth(200);
+        grid.getColumnConstraints().addAll(ccLabel, ccField);
+
+        grid.add(new Label("Column to copy:"), 0, 0);
+        grid.add(cboSource,                    1, 0);
+        grid.add(new Label("New column name:"), 0, 1);
+        grid.add(tfNewName,                    1, 1);
+        grid.add(lblError,                     1, 2);
+
+        ButtonType btnCopy = new ButtonType("Copy", ButtonData.OK_DONE);
+        Dialog<ButtonType> dialog = new Dialog<>();
+        var qupath = QuPathGUI.getInstance();
+        if (qupath != null) dialog.initOwner(qupath.getStage());
+        dialog.setTitle("Copy column");
+        dialog.setHeaderText(null);
+        dialog.getDialogPane().setContent(grid);
+        dialog.getDialogPane().getButtonTypes().setAll(btnCopy, ButtonType.CANCEL);
+
+        // Keep Copy disabled while the name field is empty
+        Button btnCopyNode = (Button) dialog.getDialogPane().lookupButton(btnCopy);
+        btnCopyNode.disableProperty().bind(tfNewName.textProperty().isEmpty()
+                .or(Bindings.createBooleanBinding(
+                        () -> tfNewName.getText().isBlank(), tfNewName.textProperty())));
+
+        // Intercept the OK button to validate before closing
+        btnCopyNode.addEventFilter(ActionEvent.ACTION, e -> {
+            String dstKey = tfNewName.getText().trim();
+            if (tableHasColumn(table, dstKey)) {
+                lblError.setText("“" + dstKey + "” already exists.");
+                lblError.setVisible(true);
+                e.consume(); // keep dialog open
+            }
+        });
+
+        dialog.setOnShown(ev -> tfNewName.requestFocus());
+
+        if (dialog.showAndWait().map(b -> b.getButtonData() != ButtonData.OK_DONE).orElse(true))
+            return;
+
+        String srcKey = cboSource.getValue();
+        String dstKey = tfNewName.getText().trim();
+
+        // Build the new column (not yet added to the table — ColumnCopyEdit.redo() does that)
+        TableColumn<ImageEntryWrapper, String> newCol = new TableColumn<>(dstKey);
+        newCol.setCellFactory(TextFieldTableCell.forTableColumn());
+        newCol.setEditable(true);
+        bindColumnToKey(newCol, dstKey, context);
+
+        context.execute(new ColumnCopyEdit(table, newCol, entries, srcKey, dstKey));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void renameColumn(TableView<ImageEntryWrapper> table,
+                                      List<ImageEntryWrapper> entries,
+                                      EditorContext context) {
+        List<String> renameable = new ArrayList<>();
+        for (TableColumn<ImageEntryWrapper, ?> col : table.getColumns()) {
+            String h = col.getText();
+            if (!INDEX.equals(h) && !IMAGE_NAME.equals(h))
+                renameable.add(h);
+        }
+        if (renameable.isEmpty()) {
+            Dialogs.showInfoNotification("Rename column", "No metadata columns to rename.");
+            return;
+        }
+
+        // ---- Single dialog: column dropdown + new-name text field -----------
+        javafx.scene.control.ComboBox<String> cboCol = new javafx.scene.control.ComboBox<>();
+        cboCol.getItems().setAll(renameable);
+        // Pre-select whichever column the user has focused in the table
+        String focusedRename = focusedColumnName(table, renameable);
+        cboCol.setValue(focusedRename != null ? focusedRename : renameable.get(0));
+
+        TextField tfNewName = new TextField(cboCol.getValue());
+        tfNewName.setPromptText("New column name");
+        tfNewName.selectAll(); // convenient: user can just start typing the new name
+
+        // Keep the text field in sync when the source selection changes,
+        // but only if the user hasn't already edited it away from the old column name.
+        cboCol.valueProperty().addListener((obs, oldCol, newCol) -> {
+            if (tfNewName.getText().trim().equals(oldCol))
+                tfNewName.setText(newCol);
+        });
+
+        // Inline error label — shown without closing the dialog
+        Label lblError = new Label();
+        lblError.setStyle("-fx-text-fill: -fx-error; -fx-font-size: 0.9em;");
+        lblError.setVisible(false);
+        lblError.managedProperty().bind(lblError.visibleProperty());
+        tfNewName.textProperty().addListener((obs, o, n) -> lblError.setVisible(false));
+
+        javafx.scene.layout.GridPane grid = new javafx.scene.layout.GridPane();
+        grid.setHgap(10);
+        grid.setVgap(8);
+        grid.setPadding(new Insets(12, 16, 4, 16));
+        javafx.scene.layout.ColumnConstraints ccLabel = new javafx.scene.layout.ColumnConstraints();
+        ccLabel.setMinWidth(javafx.scene.layout.Region.USE_PREF_SIZE);
+        javafx.scene.layout.ColumnConstraints ccField = new javafx.scene.layout.ColumnConstraints();
+        ccField.setHgrow(Priority.ALWAYS);
+        ccField.setMinWidth(200);
+        grid.getColumnConstraints().addAll(ccLabel, ccField);
+
+        grid.add(new Label("Column to rename:"), 0, 0);
+        grid.add(cboCol,                          1, 0);
+        grid.add(new Label("New name:"),          0, 1);
+        grid.add(tfNewName,                       1, 1);
+        grid.add(lblError,                        1, 2);
+
+        ButtonType btnRename = new ButtonType("Rename", ButtonData.OK_DONE);
+        Dialog<ButtonType> dialog = new Dialog<>();
+        var qupath = QuPathGUI.getInstance();
+        if (qupath != null) dialog.initOwner(qupath.getStage());
+        dialog.setTitle("Rename column");
+        dialog.setHeaderText(null);
+        dialog.getDialogPane().setContent(grid);
+        dialog.getDialogPane().getButtonTypes().setAll(btnRename, ButtonType.CANCEL);
+
+        // Keep Rename disabled while the name field is blank
+        Button btnRenameNode = (Button) dialog.getDialogPane().lookupButton(btnRename);
+        btnRenameNode.disableProperty().bind(
+                Bindings.createBooleanBinding(
+                        () -> tfNewName.getText().isBlank(), tfNewName.textProperty()));
+
+        // Intercept to validate without closing
+        btnRenameNode.addEventFilter(ActionEvent.ACTION, e -> {
+            String oldKey = cboCol.getValue();
+            String newKey = tfNewName.getText().trim();
+            if (newKey.equals(oldKey)) {
+                // Silently close — nothing to do is not an error
+                return;
+            }
+            if (tableHasColumn(table, newKey)) {
+                lblError.setText("“" + newKey + "” already exists.");
+                lblError.setVisible(true);
+                e.consume(); // keep dialog open
+            }
+        });
+
+        dialog.setOnShown(ev -> { tfNewName.requestFocus(); tfNewName.selectAll(); });
+
+        if (dialog.showAndWait().map(b -> b.getButtonData() != ButtonData.OK_DONE).orElse(true))
+            return;
+
+        String oldKey = cboCol.getValue();
+        String newKey = tfNewName.getText().trim();
+        if (newKey.equals(oldKey)) return;
+
+        TableColumn<ImageEntryWrapper, String> col = (TableColumn<ImageEntryWrapper, String>)
+                table.getColumns().stream().filter(c -> oldKey.equals(c.getText())).findFirst().orElse(null);
+        if (col == null) return;
+
+        context.execute(new ColumnRenameEdit(col, entries, oldKey, newKey, context));
+    }
+
+    /**
+     * Returns the metadata column name that is currently focused/selected in the
+     * table, or {@code null} if the focused column is not in {@code candidates}.
+     * Used to pre-select the relevant column in Copy / Rename dialogs.
+     */
+    private static String focusedColumnName(TableView<ImageEntryWrapper> table,
+                                             List<String> candidates) {
+        var selected = table.getSelectionModel().getSelectedCells();
+        if (selected.isEmpty()) return null;
+        var col = selected.get(0).getTableColumn();
+        if (col == null) return null;
+        String name = col.getText();
+        return candidates.contains(name) ? name : null;
     }
 
     private static boolean tableHasColumn(TableView<?> table, String name) {
         return table.getColumns().stream().anyMatch(col -> col.getText().equals(name));
+    }
+
+    // CellProfiler-compatible column names
+    private static final String COL_PATHNAME = "PathName";
+    private static final String COL_FILENAME  = "FileName";
+
+    /**
+     * Populates {@code PathName} and {@code FileName} metadata columns from each
+     * entry's first URI, using CellProfiler naming conventions.
+     * <p>
+     * For {@code file://} URIs the native filesystem path is used so the values
+     * are immediately usable in CellProfiler pipelines.  For non-file URIs (e.g.
+     * OMERO) the URI's path component is split on {@code '/'} as a best-effort
+     * fallback.
+     * <p>
+     * If either column already contains values the user is asked whether to
+     * overwrite or skip those cells.  The entire operation is a single undoable
+     * batch.
+     */
+    private static void addPathNameFileNameColumns(TableView<ImageEntryWrapper> table,
+                                                    List<ImageEntryWrapper> entries,
+                                                    EditorContext context) {
+        // Check whether either column already has values
+        boolean hasExisting = false;
+        for (String col : List.of(COL_PATHNAME, COL_FILENAME)) {
+            if (!tableHasColumn(table, col)) continue;
+            for (ImageEntryWrapper w : entries) {
+                String v = w.getMetadataValue(col);
+                if (v != null && !v.isEmpty()) { hasExisting = true; break; }
+            }
+            if (hasExisting) break;
+        }
+
+        boolean overwrite = true;
+        if (hasExisting) {
+            ButtonType btnOverwrite = new ButtonType("Overwrite");
+            ButtonType btnSkip      = new ButtonType("Skip existing");
+            Dialog<ButtonType> d = new Dialog<>();
+            var qupath = QuPathGUI.getInstance();
+            if (qupath != null) d.initOwner(qupath.getStage());
+            d.setTitle("PathName \u0026 FileName columns");
+            d.setHeaderText("One or both columns already contain values.");
+            d.setContentText(
+                    "Overwrite   \u2014 replace all existing values\n" +
+                    "Skip existing \u2014 leave cells that already have a value unchanged");
+            d.getDialogPane().getButtonTypes().setAll(btnOverwrite, btnSkip, ButtonType.CANCEL);
+            var choice = d.showAndWait();
+            if (choice.isEmpty() || choice.get() == ButtonType.CANCEL) return;
+            overwrite = (choice.get() == btnOverwrite);
+        }
+
+        // Ensure columns exist in the table (creates them if absent)
+        for (String col : List.of(COL_PATHNAME, COL_FILENAME)) {
+            if (!tableHasColumn(table, col))
+                addTableColumn(table, col, context);
+        }
+
+        final boolean doOverwrite = overwrite;
+        MetadataEdit batchEdit = new MetadataEdit();
+        int skipped = 0;
+
+        for (ImageEntryWrapper wrapper : entries) {
+            String[] parts = resolvePathAndFile(wrapper.entry);
+            String newPath = parts[0];
+            String newFile = parts[1];
+
+            for (String[] pair : new String[][]{{COL_PATHNAME, newPath}, {COL_FILENAME, newFile}}) {
+                String col    = pair[0];
+                String newVal = pair[1];
+                String oldVal = wrapper.getMetadataValue(col);
+                boolean hasValue = oldVal != null && !oldVal.isEmpty();
+                if (hasValue && !doOverwrite) { skipped++; continue; }
+                if (newVal.equals(oldVal == null ? "" : oldVal)) continue;
+                batchEdit.addChange(wrapper, col, oldVal, newVal);
+            }
+        }
+
+        if (!batchEdit.isEmpty())
+            context.execute(batchEdit);
+
+        String msg = "PathName and FileName set for " + entries.size() + " image(s).";
+        if (skipped > 0)
+            msg += "\n" + skipped + " cell(s) skipped (already had a value).";
+        Dialogs.showInfoNotification("Add PathName \u0026 FileName", msg);
+    }
+
+    /**
+     * Returns {@code [pathName, fileName]} for the first URI of {@code entry}.
+     * <ul>
+     *   <li>For {@code file://} URIs the native path separator is used.</li>
+     *   <li>For other URIs (e.g. OMERO {@code http://}) the URI path component
+     *       is split on {@code '/'} as a best-effort fallback.</li>
+     *   <li>If the entry has no URIs both values are empty strings.</li>
+     * </ul>
+     */
+    private static String[] resolvePathAndFile(ProjectImageEntry<?> entry) {
+        Collection<URI> uris;
+        try {
+            uris = entry.getURIs();
+        } catch (IOException ex) {
+            logger.warn("Could not retrieve URIs for entry '{}': {}", entry.getImageName(), ex.getMessage());
+            return new String[]{"", ""};
+        }
+        if (uris == null || uris.isEmpty()) return new String[]{"", ""};
+
+        URI uri = uris.iterator().next();
+        try {
+            if ("file".equalsIgnoreCase(uri.getScheme())) {
+                // Paths.get(URI) decodes percent-encoding automatically, so spaces
+                // in directory or file names are preserved as spaces, never as %20.
+                java.nio.file.Path p = Paths.get(uri);
+                String fileName = p.getFileName() != null ? p.getFileName().toString() : "";
+                String pathName = p.getParent()   != null ? p.getParent().toString()   : "";
+                return new String[]{pathName, fileName};
+            }
+        } catch (Exception ex) {
+            logger.debug("Could not resolve file path for URI {}: {}", uri, ex.getMessage());
+        }
+
+        // Non-file URI fallback: split the URI path component.
+        // URI.getPath() returns the decoded path (unlike getRawPath()), so %20
+        // is already converted to a space here too.
+        String uriPath = uri.getPath();
+        if (uriPath == null || uriPath.isEmpty()) return new String[]{uri.toString(), ""};
+        int lastSlash = uriPath.lastIndexOf('/');
+        if (lastSlash < 0) return new String[]{"", uriPath};
+        return new String[]{uriPath.substring(0, lastSlash), uriPath.substring(lastSlash + 1)};
+    }
+
+    /**
+     * Binds a column's cell-value factory and edit-commit handler to the given
+     * metadata key.  Called once on creation and again whenever a column is
+     * renamed (redo) or a rename is undone, so the column always reads from and
+     * writes to the correct key.
+     */
+    private static void bindColumnToKey(TableColumn<ImageEntryWrapper, String> col,
+                                         String key,
+                                         EditorContext context) {
+        col.setCellValueFactory(v -> v.getValue().getProperty(key));
+        col.setOnEditCommit(e -> {
+            String newValue = e.getNewValue();
+            String oldValue = e.getOldValue();
+            if (newValue == null && oldValue == null) return;
+            if (newValue != null && newValue.equals(oldValue)) return;
+            MetadataEdit edit = new MetadataEdit();
+            edit.addChange(e.getRowValue(), key, oldValue, newValue);
+            context.execute(edit);
+        });
     }
 
     private static void addTableColumn(TableView<ImageEntryWrapper> table,
@@ -706,17 +1123,8 @@ public class ProjectMetadataEditorCommand {
                                         EditorContext context) {
         TableColumn<ImageEntryWrapper, String> col = new TableColumn<>(metadataName);
         col.setCellFactory(TextFieldTableCell.forTableColumn());
-        col.setOnEditCommit(e -> {
-            String newValue = e.getNewValue();
-            String oldValue = e.getOldValue();
-            if (newValue == null && oldValue == null) return;
-            if (newValue != null && newValue.equals(oldValue)) return;
-            MetadataEdit edit = new MetadataEdit();
-            edit.addChange(e.getRowValue(), metadataName, oldValue, newValue);
-            context.execute(edit);
-        });
-        col.setCellValueFactory(v -> v.getValue().getProperty(metadataName));
         col.setEditable(true);
+        bindColumnToKey(col, metadataName, context);
         table.getColumns().add(col);
     }
 
@@ -849,6 +1257,225 @@ public class ProjectMetadataEditorCommand {
     }
 
     // =========================================================================
+    // ENTRY FILTER
+    // =========================================================================
+
+    /**
+     * Filters the table's visible rows to those whose image name or any metadata
+     * value matches {@code text} (case-insensitive).
+     * <p>
+     * This is purely a view operation: the authoritative {@code entries} list is
+     * never modified, so Save, Undo/Redo, Remove Column, and Export all continue
+     * to operate on the full project data regardless of the current filter.
+     */
+    private static void applyEntryFilter(String text,
+                                          List<ImageEntryWrapper> entries,
+                                          TableView<ImageEntryWrapper> table,
+                                          Label statusLabel) {
+        if (text == null || text.isBlank()) {
+            table.getItems().setAll(entries);
+            statusLabel.setText("");
+            return;
+        }
+        var predicate = ProjectEntryPredicate.createIgnoreCase(text);
+        List<ImageEntryWrapper> filtered = entries.stream()
+                .filter(w -> predicate.test(w.entry))
+                .toList();
+        table.getItems().setAll(filtered);
+        int shown = filtered.size();
+        int total = entries.size();
+        statusLabel.setText(shown == total
+                ? ""
+                : "Showing " + shown + " of " + total);
+    }
+
+    // =========================================================================
+    // SEARCH & REPLACE
+    // =========================================================================
+
+    /**
+     * Shows a Search &amp; Replace dialog scoped to a single user-selected metadata column.
+     * <p>
+     * All replacements are recorded as a single {@link MetadataEdit} and pushed onto the
+     * undo/redo stack, so they can be reversed with a single Ctrl+Z.
+     */
+    private static void showSearchReplaceDialog(TableView<ImageEntryWrapper> table,
+                                                 EditorContext context) {
+        // Collect editable (metadata) columns only
+        List<String> metadataColumns = new ArrayList<>();
+        for (TableColumn<ImageEntryWrapper, ?> col : table.getColumns()) {
+            String h = col.getText();
+            if (!INDEX.equals(h) && !IMAGE_NAME.equals(h))
+                metadataColumns.add(h);
+        }
+        if (metadataColumns.isEmpty()) {
+            Dialogs.showInfoNotification("Search & Replace", "No metadata columns to search.");
+            return;
+        }
+
+        // ---- Build dialog layout -------------------------------------------
+        javafx.scene.control.ComboBox<String> cboColumn = new javafx.scene.control.ComboBox<>();
+        cboColumn.getItems().setAll(metadataColumns);
+
+        // Pre-select the column that is currently focused in the table, if any
+        var selectedCells = table.getSelectionModel().getSelectedCells();
+        if (!selectedCells.isEmpty()) {
+            String focusedCol = selectedCells.get(0).getTableColumn().getText();
+            if (metadataColumns.contains(focusedCol))
+                cboColumn.setValue(focusedCol);
+        }
+        if (cboColumn.getValue() == null)
+            cboColumn.setValue(metadataColumns.get(0));
+
+        javafx.scene.control.TextField tfSearch  = new javafx.scene.control.TextField();
+        javafx.scene.control.TextField tfReplace = new javafx.scene.control.TextField();
+        javafx.scene.control.CheckBox  cbCase    = new javafx.scene.control.CheckBox("Case sensitive");
+        javafx.scene.control.CheckBox  cbWhole   = new javafx.scene.control.CheckBox("Match whole cell");
+
+        javafx.scene.layout.GridPane grid = new javafx.scene.layout.GridPane();
+        grid.setHgap(10);
+        grid.setVgap(8);
+        grid.setPadding(new Insets(12, 16, 4, 16));
+
+        int row = 0;
+        grid.add(new javafx.scene.control.Label("Column:"),      0, row);
+        grid.add(cboColumn,                                        1, row++);
+        grid.add(new javafx.scene.control.Label("Search for:"),  0, row);
+        grid.add(tfSearch,                                         1, row++);
+        grid.add(new javafx.scene.control.Label("Replace with:"), 0, row);
+        grid.add(tfReplace,                                        1, row++);
+        grid.add(cbCase,  1, row++);
+        grid.add(cbWhole, 1, row);
+
+        javafx.scene.layout.ColumnConstraints cc1 = new javafx.scene.layout.ColumnConstraints();
+        cc1.setMinWidth(javafx.scene.layout.Region.USE_PREF_SIZE);
+        javafx.scene.layout.ColumnConstraints cc2 = new javafx.scene.layout.ColumnConstraints();
+        cc2.setHgrow(javafx.scene.layout.Priority.ALWAYS);
+        cc2.setMinWidth(220);
+        grid.getColumnConstraints().addAll(cc1, cc2);
+
+        // Live preview label showing match count
+        javafx.scene.control.Label lblPreview = new javafx.scene.control.Label();
+        lblPreview.setStyle("-fx-text-fill: -fx-accent;");
+        grid.add(lblPreview, 0, ++row, 2, 1);
+
+        // Update preview whenever any relevant field changes
+        Runnable updatePreview = () -> {
+            String colKey      = cboColumn.getValue();
+            String searchText  = tfSearch.getText();
+            boolean caseSens   = cbCase.isSelected();
+            boolean wholeCell  = cbWhole.isSelected();
+            if (colKey == null || searchText.isEmpty()) {
+                lblPreview.setText("");
+                return;
+            }
+            long count = table.getItems().stream().filter(w -> {
+                String val = w.getMetadataValue(colKey);
+                if (val == null) return false;
+                return matches(val, searchText, caseSens, wholeCell);
+            }).count();
+            lblPreview.setText(count == 0 ? "No matches found."
+                    : count + " cell" + (count == 1 ? "" : "s") + " will be updated.");
+        };
+
+        tfSearch.textProperty().addListener((obs, o, n) -> updatePreview.run());
+        cboColumn.valueProperty().addListener((obs, o, n) -> updatePreview.run());
+        cbCase.selectedProperty().addListener((obs, o, n) -> updatePreview.run());
+        cbWhole.selectedProperty().addListener((obs, o, n) -> updatePreview.run());
+
+        // ---- Show dialog ---------------------------------------------------
+        ButtonType btnReplace = new ButtonType("Replace All", ButtonData.OK_DONE);
+        Dialog<ButtonType> dialog = new Dialog<>();
+        var qupath = QuPathGUI.getInstance();
+        if (qupath != null) dialog.initOwner(qupath.getStage());
+        dialog.setTitle("Search & Replace");
+        dialog.setHeaderText(null);
+        dialog.getDialogPane().setContent(grid);
+        dialog.getDialogPane().getButtonTypes().setAll(btnReplace, ButtonType.CANCEL);
+
+        // Disable Replace All when search field is empty
+        Button btnReplaceNode =
+                (Button) dialog.getDialogPane().lookupButton(btnReplace);
+        btnReplaceNode.disableProperty().bind(tfSearch.textProperty().isEmpty());
+
+        // Focus the search field when the dialog opens
+        dialog.setOnShown(ev -> tfSearch.requestFocus());
+
+        Optional<ButtonType> result = dialog.showAndWait();
+        if (result.isEmpty() || result.get().getButtonData() != ButtonData.OK_DONE)
+            return;
+
+        // ---- Apply replacements as a single undoable batch -----------------
+        String colKey      = cboColumn.getValue();
+        String searchText  = tfSearch.getText();
+        String replaceText = tfReplace.getText();
+        boolean caseSens   = cbCase.isSelected();
+        boolean wholeCell  = cbWhole.isSelected();
+
+        // Operates on table.getItems() — if a filter is active, only visible rows
+        // are affected. This is intentional: filter first, then replace.
+        MetadataEdit batchEdit = new MetadataEdit();
+        for (ImageEntryWrapper wrapper : table.getItems()) {
+            String oldVal = wrapper.getMetadataValue(colKey);
+            if (oldVal == null) continue;
+            if (!matches(oldVal, searchText, caseSens, wholeCell)) continue;
+            String newVal = wholeCell
+                    ? replaceText
+                    : replaceAll(oldVal, searchText, replaceText, caseSens);
+            if (!newVal.equals(oldVal))
+                batchEdit.addChange(wrapper, colKey, oldVal, newVal);
+        }
+
+        if (batchEdit.isEmpty()) {
+            Dialogs.showInfoNotification("Search & Replace", "No matching cells found.");
+        } else {
+            context.execute(batchEdit);
+            Dialogs.showInfoNotification("Search & Replace",
+                    "Replaced values in " + countChanges(batchEdit) + " cell(s) in column \u201c" + colKey + "\u201d.");
+        }
+    }
+
+    /** Returns true when {@code cellValue} is considered a match for the search term. */
+    private static boolean matches(String cellValue, String searchText,
+                                    boolean caseSensitive, boolean wholeCell) {
+        if (wholeCell) {
+            return caseSensitive
+                    ? cellValue.equals(searchText)
+                    : cellValue.equalsIgnoreCase(searchText);
+        } else {
+            return caseSensitive
+                    ? cellValue.contains(searchText)
+                    : cellValue.toLowerCase().contains(searchText.toLowerCase());
+        }
+    }
+
+    /** Replaces all occurrences of {@code search} in {@code value} with {@code replacement}. */
+    private static String replaceAll(String value, String search,
+                                      String replacement, boolean caseSensitive) {
+        if (caseSensitive) {
+            return value.replace(search, replacement);
+        }
+        // Case-insensitive replace that preserves the rest of the string
+        StringBuilder sb = new StringBuilder();
+        String lowerValue  = value.toLowerCase();
+        String lowerSearch = search.toLowerCase();
+        int start = 0;
+        int idx;
+        while ((idx = lowerValue.indexOf(lowerSearch, start)) >= 0) {
+            sb.append(value, start, idx);
+            sb.append(replacement);
+            start = idx + search.length();
+        }
+        sb.append(value, start, value.length());
+        return sb.toString();
+    }
+
+    /** Counts the number of individual changes in a {@link MetadataEdit}. */
+    private static int countChanges(MetadataEdit edit) {
+        return edit.changes.size();
+    }
+
+    // =========================================================================
     // DELETE / BATCH EDIT
     // =========================================================================
 
@@ -889,9 +1516,21 @@ public class ProjectMetadataEditorCommand {
     // UNDO / REDO
     // =========================================================================
 
+    /**
+     * Common interface for all undoable operations in the editor.
+     * <p>
+     * {@link MetadataEdit} handles cell-level changes.
+     * {@link ColumnRenameEdit}, {@link ColumnCopyEdit}, and {@link ColumnRemoveEdit}
+     * handle column-level structural changes (header + data together).
+     */
+    private interface UndoableEdit {
+        void undo();
+        void redo();
+    }
+
     private static class EditorContext {
-        final Stack<MetadataEdit> undoStack = new Stack<>();
-        final Stack<MetadataEdit> redoStack = new Stack<>();
+        final Stack<UndoableEdit> undoStack = new Stack<>();
+        final Stack<UndoableEdit> redoStack = new Stack<>();
         final TableView<ImageEntryWrapper> table;
         final MenuItem miUndo;
         final MenuItem miRedo;
@@ -903,7 +1542,7 @@ public class ProjectMetadataEditorCommand {
             updateMenuState();
         }
 
-        void execute(MetadataEdit edit) {
+        void execute(UndoableEdit edit) {
             edit.redo();
             undoStack.push(edit);
             redoStack.clear();
@@ -913,7 +1552,7 @@ public class ProjectMetadataEditorCommand {
 
         void undo() {
             if (undoStack.isEmpty()) return;
-            MetadataEdit edit = undoStack.pop();
+            UndoableEdit edit = undoStack.pop();
             edit.undo();
             redoStack.push(edit);
             updateMenuState();
@@ -922,7 +1561,7 @@ public class ProjectMetadataEditorCommand {
 
         void redo() {
             if (redoStack.isEmpty()) return;
-            MetadataEdit edit = redoStack.pop();
+            UndoableEdit edit = redoStack.pop();
             edit.redo();
             undoStack.push(edit);
             updateMenuState();
@@ -941,8 +1580,8 @@ public class ProjectMetadataEditorCommand {
     // METADATA EDIT MODEL
     // =========================================================================
 
-    private static class MetadataEdit {
-        private final List<SingleChange> changes = new ArrayList<>();
+    private static class MetadataEdit implements UndoableEdit {
+        final List<SingleChange> changes = new ArrayList<>();
 
         void addChange(ImageEntryWrapper wrapper, String key, String oldValue, String newValue) {
             changes.add(new SingleChange(wrapper, key, oldValue, newValue));
@@ -950,14 +1589,14 @@ public class ProjectMetadataEditorCommand {
 
         boolean isEmpty() { return changes.isEmpty(); }
 
-        void undo() {
+        public void undo() {
             for (SingleChange c : changes) {
                 if (c.oldValue == null) c.wrapper.removeMetadataValue(c.key);
                 else                   c.wrapper.putMetadataValue(c.key, c.oldValue);
             }
         }
 
-        void redo() {
+        public void redo() {
             for (SingleChange c : changes) {
                 if (c.newValue == null) c.wrapper.removeMetadataValue(c.key);
                 else                   c.wrapper.putMetadataValue(c.key, c.newValue);
@@ -976,6 +1615,137 @@ public class ProjectMetadataEditorCommand {
             this.key      = key;
             this.oldValue = oldValue;
             this.newValue = newValue;
+        }
+    }
+
+    // =========================================================================
+    // COLUMN-LEVEL UNDOABLE EDITS
+    // =========================================================================
+
+    /**
+     * Renames a metadata column: updates the column header, rebinds the cell
+     * factory, and migrates every wrapper's data from the old key to the new key.
+     * Fully reversible.
+     */
+    private static class ColumnRenameEdit implements UndoableEdit {
+        private final TableColumn<ImageEntryWrapper, String> column;
+        private final List<ImageEntryWrapper> allEntries;
+        private final String oldName;
+        private final String newName;
+        private final EditorContext context;
+
+        ColumnRenameEdit(TableColumn<ImageEntryWrapper, String> column,
+                          List<ImageEntryWrapper> allEntries,
+                          String oldName, String newName, EditorContext context) {
+            this.column     = column;
+            this.allEntries = allEntries;
+            this.oldName    = oldName;
+            this.newName    = newName;
+            this.context    = context;
+        }
+
+        @Override
+        public void redo() {
+            column.setText(newName);
+            bindColumnToKey(column, newName, context);
+            for (ImageEntryWrapper w : allEntries) {
+                String val = w.getMetadataValue(oldName);
+                w.removeMetadataValue(oldName);
+                if (val != null) w.putMetadataValue(newName, val);
+            }
+        }
+
+        @Override
+        public void undo() {
+            column.setText(oldName);
+            bindColumnToKey(column, oldName, context);
+            for (ImageEntryWrapper w : allEntries) {
+                String val = w.getMetadataValue(newName);
+                w.removeMetadataValue(newName);
+                if (val != null) w.putMetadataValue(oldName, val);
+            }
+        }
+    }
+
+    /**
+     * Copies a metadata column: adds a new column to the table and populates
+     * it with the source column's values.  Undo removes the column and clears
+     * the copied values.
+     */
+    private static class ColumnCopyEdit implements UndoableEdit {
+        private final TableView<ImageEntryWrapper> table;
+        private final TableColumn<ImageEntryWrapper, String> newColumn;
+        private final List<ImageEntryWrapper> allEntries;
+        private final String srcKey;
+        private final String dstKey;
+
+        ColumnCopyEdit(TableView<ImageEntryWrapper> table,
+                        TableColumn<ImageEntryWrapper, String> newColumn,
+                        List<ImageEntryWrapper> allEntries,
+                        String srcKey, String dstKey) {
+            this.table      = table;
+            this.newColumn  = newColumn;
+            this.allEntries = allEntries;
+            this.srcKey     = srcKey;
+            this.dstKey     = dstKey;
+        }
+
+        @Override
+        public void redo() {
+            if (!table.getColumns().contains(newColumn))
+                table.getColumns().add(newColumn);
+            for (ImageEntryWrapper w : allEntries) {
+                String val = w.getMetadataValue(srcKey);
+                if (val != null) w.putMetadataValue(dstKey, val);
+            }
+        }
+
+        @Override
+        public void undo() {
+            table.getColumns().remove(newColumn);
+            for (ImageEntryWrapper w : allEntries)
+                w.removeMetadataValue(dstKey);
+        }
+    }
+
+    /**
+     * Removes a metadata column: saves the column's position and all its values
+     * so they can be fully restored by undo.
+     */
+    private static class ColumnRemoveEdit implements UndoableEdit {
+        private final TableView<ImageEntryWrapper> table;
+        private final TableColumn<ImageEntryWrapper, String> column;
+        private final Map<ImageEntryWrapper, String> savedValues = new LinkedHashMap<>();
+        private final int columnIndex;
+
+        ColumnRemoveEdit(TableView<ImageEntryWrapper> table,
+                          TableColumn<ImageEntryWrapper, String> column,
+                          List<ImageEntryWrapper> allEntries) {
+            this.table       = table;
+            this.column      = column;
+            this.columnIndex = table.getColumns().indexOf(column);
+            String key = column.getText();
+            for (ImageEntryWrapper w : allEntries) {
+                String val = w.getMetadataValue(key);
+                if (val != null) savedValues.put(w, val);
+            }
+        }
+
+        @Override
+        public void redo() {
+            String key = column.getText();
+            table.getColumns().remove(column);
+            for (ImageEntryWrapper w : savedValues.keySet())
+                w.removeMetadataValue(key);
+        }
+
+        @Override
+        public void undo() {
+            String key = column.getText();
+            int insertAt = Math.min(columnIndex, table.getColumns().size());
+            table.getColumns().add(insertAt, column);
+            for (Map.Entry<ImageEntryWrapper, String> e : savedValues.entrySet())
+                e.getKey().putMetadataValue(key, e.getValue());
         }
     }
 

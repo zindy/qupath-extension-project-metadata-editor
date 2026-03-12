@@ -5,11 +5,10 @@ plugins {
     id("qupath-conventions")
 }
 
-
 qupathExtension {
     name = "qupath-extension-project-metadata-editor"
     group = "io.github.qupath"
-    version = "0.1.0-SNAPSHOT"
+    version = file("VERSION").readText().trim()
     description = "Edit metadata for all images in a QuPath project"
     automaticModule = "io.github.qupath.extension.project-metadata-editor"
 }
