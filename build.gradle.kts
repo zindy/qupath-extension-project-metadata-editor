@@ -5,10 +5,22 @@ plugins {
     id("qupath-conventions")
 }
 
+// Get version from Environment Variable (GitHub Actions) or fallback to VERSION file
+// 1. Get the tag name from GitHub (e.g., "v1.0.3" or "v1.0.3-rc1")
+val githubTag = System.getenv("GITHUB_REF_NAME")
+
+// 2. Determine the final version string
+val releaseVersion = if (githubTag != null && githubTag.startsWith("v")) {
+    githubTag.removePrefix("v") // Use the tag (stripped of 'v')
+} else {
+    file("VERSION").readText().trim() // Fallback to your SNAPSHOT file
+}
+
+// TODO: Configure your extension here (please change the defaults!)
 qupathExtension {
     name = "qupath-extension-project-metadata-editor"
     group = "io.github.qupath"
-    version = file("VERSION").readText().trim()
+    version = releaseVersion
     description = "Edit metadata for all images in a QuPath project"
     automaticModule = "io.github.qupath.extension.project-metadata-editor"
 }

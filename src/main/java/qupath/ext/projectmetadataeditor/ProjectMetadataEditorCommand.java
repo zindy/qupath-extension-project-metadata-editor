@@ -32,6 +32,8 @@ import java.io.PrintWriter;
 import java.net.URI;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Random;
 import java.util.Comparator;
 import java.util.Arrays;
 import java.util.Collection;
@@ -246,6 +248,9 @@ public class ProjectMetadataEditorCommand {
         miRemoveCol.setOnAction(e -> removeColumn(table, entries, context));
 
         MenuItem miAddPathFileCols = new MenuItem("Add PathName \u0026 FileName columns");
+
+        MenuItem miAssignSplit = new MenuItem("Assign train/validation/test split\u2026");
+        miAssignSplit.setOnAction(e -> assignTrainValTestSplit(table, entries, context));
         miAddPathFileCols.setOnAction(e -> addPathNameFileNameColumns(table, entries, context));
 
         MenuItem miCopyCol = new MenuItem("Copy column\u2026");
@@ -281,7 +286,7 @@ public class ProjectMetadataEditorCommand {
         menuEdit.getItems().addAll(
                 miUndo, miRedo,
                 new SeparatorMenuItem(),
-                miAddCol, miRemoveCol, miCopyCol, miRenameCol, miAddPathFileCols,
+                miAddCol, miRemoveCol, miCopyCol, miRenameCol, miAddPathFileCols, miAssignSplit,
                 new SeparatorMenuItem(),
                 miCopy, miCopyFull, miPaste,
                 new SeparatorMenuItem(),
@@ -975,6 +980,234 @@ public class ProjectMetadataEditorCommand {
     private static final String COL_FILENAME  = "FileName";
 
     /**
+     * Shows a dialog to assign "training", "validation", and "test" labels to
+     * every image entry, written into a user-named metadata column.
+     * <p>
+     * The user specifies:
+     * <ul>
+     *   <li>Column name (default "Split")</li>
+     *   <li>Random seed (default 42)</li>
+     *   <li>Training % and Validation % — Test % is derived as 100 − train − val</li>
+     * </ul>
+     * Images are shuffled with the given seed, then assigned labels by cumulative
+     * proportion so the result is fully reproducible.  The operation is a single
+     * undoable batch.
+     */
+    private static void assignTrainValTestSplit(TableView<ImageEntryWrapper> table,
+                                                 List<ImageEntryWrapper> entries,
+                                                 EditorContext context) {
+        var visibleEntries = table.getItems();
+        if (visibleEntries.isEmpty()) {
+            Dialogs.showInfoNotification("Train/val/test split", "No images in project.");
+            return;
+        }
+
+        // ---- Dialog layout --------------------------------------------------
+        TextField tfColName = new TextField("Split");
+        tfColName.setPromptText("Column name");
+
+        javafx.scene.control.Spinner<Integer> spnSeed =
+                new javafx.scene.control.Spinner<>(Integer.MIN_VALUE, Integer.MAX_VALUE, 42);
+        spnSeed.setEditable(true);
+        spnSeed.setPrefWidth(100);
+
+        javafx.scene.control.Spinner<Integer> spnTrain =
+                new javafx.scene.control.Spinner<>(0, 100, 80);
+        spnTrain.setEditable(true);
+        spnTrain.setPrefWidth(80);
+
+        javafx.scene.control.Spinner<Integer> spnVal =
+                new javafx.scene.control.Spinner<>(0, 100, 10);
+        spnVal.setEditable(true);
+        spnVal.setPrefWidth(80);
+
+        // Test % = 100 - train - val, shown read-only
+        Label lblTest = new Label("10 %");
+        lblTest.setPrefWidth(80);
+        lblTest.setStyle("-fx-font-weight: bold;");
+
+        Label lblError = new Label();
+        lblError.setStyle("-fx-text-fill: -fx-error; -fx-font-size: 0.9em;");
+        lblError.setVisible(false);
+        lblError.managedProperty().bind(lblError.visibleProperty());
+
+        // Update the derived test % and error state whenever train or val change
+        Runnable updateTest = () -> {
+            int train = spnTrain.getValue();
+            int val   = spnVal.getValue();
+            int test  = 100 - train - val;
+            if (test < 0) {
+                lblTest.setText("–");
+                lblTest.setStyle("-fx-font-weight: bold; -fx-text-fill: -fx-error;");
+                lblError.setText("Training + validation exceeds 100 %.");
+                lblError.setVisible(true);
+            } else {
+                lblTest.setText(test + " %");
+                lblTest.setStyle("-fx-font-weight: bold;");
+                lblError.setVisible(false);
+            }
+        };
+        spnTrain.valueProperty().addListener((obs, o, n) -> updateTest.run());
+        spnVal.valueProperty().addListener((obs, o, n) -> updateTest.run());
+        updateTest.run();
+
+        // Column-name error (separate label, reused)
+        Label lblColError = new Label();
+        lblColError.setStyle("-fx-text-fill: -fx-accent; -fx-font-size: 0.9em;");
+        lblColError.setVisible(false);
+        lblColError.managedProperty().bind(lblColError.visibleProperty());
+        tfColName.textProperty().addListener((obs, o, n) -> lblColError.setVisible(false));
+
+        // Layout
+        javafx.scene.layout.GridPane grid = new javafx.scene.layout.GridPane();
+        grid.setHgap(10);
+        grid.setVgap(8);
+        grid.setPadding(new Insets(12, 16, 4, 16));
+        javafx.scene.layout.ColumnConstraints cc0 = new javafx.scene.layout.ColumnConstraints();
+        cc0.setMinWidth(javafx.scene.layout.Region.USE_PREF_SIZE);
+        javafx.scene.layout.ColumnConstraints cc1 = new javafx.scene.layout.ColumnConstraints();
+        cc1.setHgrow(Priority.ALWAYS);
+        grid.getColumnConstraints().addAll(cc0, cc1);
+
+        int r = 0;
+        grid.add(new Label("Column name:"), 0, r);   grid.add(tfColName, 1, r++);
+        grid.add(lblColError,               1, r++);
+        grid.add(new javafx.scene.control.Separator(), 0, r++, 2, 1);
+        grid.add(new Label("Random seed:"), 0, r);   grid.add(spnSeed,   1, r++);
+        grid.add(new javafx.scene.control.Separator(), 0, r++, 2, 1);
+
+        // Split % rows with inline description
+        grid.add(new Label("Training %:"),   0, r);  grid.add(spnTrain,  1, r++);
+        grid.add(new Label("Validation %:"), 0, r);  grid.add(spnVal,    1, r++);
+
+        HBox testRow = new HBox(6, new Label("Test %:"), lblTest,
+                new Label("(derived)"));
+        testRow.setAlignment(Pos.CENTER_LEFT);
+        testRow.setStyle("-fx-text-fill: -fx-mid-text-color;");
+        grid.add(new Label("Test %:"), 0, r);        grid.add(
+                new HBox(6, lblTest, new Label("(derived)")), 1, r++);
+        grid.add(lblError, 0, r++, 2, 1);
+
+        // n-images summary so the user knows what 80% means in practice
+        Label lblSummary = new Label();
+        lblSummary.setText(visibleEntries.size() + " images — "
+                + "approx. " + Math.round(visibleEntries.size() * 0.8) + " / "
+                + Math.round(visibleEntries.size() * 0.1) + " / "
+                + Math.round(visibleEntries.size() * 0.1) + " at 80/10/10");
+        lblSummary.setStyle("-fx-text-fill: -fx-mid-text-color; -fx-font-size: 0.9em;");
+
+        // Update summary when spinners change
+        Runnable updateSummary = () -> {
+            double tr = spnTrain.getValue() / 100.0;
+            double v  = spnVal.getValue()   / 100.0;
+            double te = 1.0 - tr - v;
+            if (te < 0) { lblSummary.setText(""); return; }
+            int n = visibleEntries.size();
+            lblSummary.setText(n + " images — approx. "
+                    + Math.round(n * tr) + " training / "
+                    + Math.round(n * v)  + " validation / "
+                    + Math.round(n * te) + " test");
+        };
+        spnTrain.valueProperty().addListener((obs, o, n2) -> updateSummary.run());
+        spnVal.valueProperty().addListener((obs, o, n2) -> updateSummary.run());
+        updateSummary.run();
+
+        grid.add(lblSummary, 0, r++, 2, 1);
+
+        ButtonType btnAssign = new ButtonType("Assign", ButtonData.OK_DONE);
+        Dialog<ButtonType> dialog = new Dialog<>();
+        var qupath = QuPathGUI.getInstance();
+        if (qupath != null) dialog.initOwner(qupath.getStage());
+        dialog.setTitle("Assign train/validation/test split");
+        dialog.setHeaderText(null);
+        dialog.getDialogPane().setContent(grid);
+        dialog.getDialogPane().getButtonTypes().setAll(btnAssign, ButtonType.CANCEL);
+        dialog.getDialogPane().setPrefWidth(400);
+
+        Button btnAssignNode = (Button) dialog.getDialogPane().lookupButton(btnAssign);
+
+        // Disable Assign when: column name blank, or train+val > 100
+        btnAssignNode.disableProperty().bind(
+                Bindings.createBooleanBinding(
+                        () -> tfColName.getText().isBlank()
+                                || (spnTrain.getValue() + spnVal.getValue()) > 100,
+                        tfColName.textProperty(),
+                        spnTrain.valueProperty(),
+                        spnVal.valueProperty()));
+
+        // Intercept to handle existing column without closing dialog
+        btnAssignNode.addEventFilter(ActionEvent.ACTION, ev -> {
+            String colName = tfColName.getText().trim();
+            if (tableHasColumn(table, colName)) {
+                // Ask overwrite/cancel — if cancel, keep dialog open
+                ButtonType btnOverwrite = new ButtonType("Overwrite");
+                Dialog<ButtonType> confirm = new Dialog<>();
+                if (qupath != null) confirm.initOwner(qupath.getStage());
+                confirm.setTitle("Column exists");
+                confirm.setContentText(
+                        "Column \u201c" + colName + "\u201d already exists.\nOverwrite its values?");
+                confirm.getDialogPane().getButtonTypes().setAll(btnOverwrite, ButtonType.CANCEL);
+                var choice = confirm.showAndWait();
+                if (choice.isEmpty() || choice.get() != btnOverwrite) {
+                    ev.consume(); // keep main dialog open
+                }
+            }
+        });
+
+        dialog.setOnShown(ev -> tfColName.requestFocus());
+
+        if (dialog.showAndWait().map(b -> b.getButtonData() != ButtonData.OK_DONE).orElse(true))
+            return;
+
+        // ---- Compute split -------------------------------------------------
+        String colName = tfColName.getText().trim();
+        int    seed    = spnSeed.getValue();
+        int    train   = spnTrain.getValue();
+        int    val     = spnVal.getValue();
+        // Operate on visible (filtered) rows only — same as Search & Replace
+        int    n       = visibleEntries.size();
+
+        // Shuffle indices with the seed; assign labels by cumulative threshold
+        List<Integer> indices = new ArrayList<>();
+        for (int i = 0; i < n; i++) indices.add(i);
+        Collections.shuffle(indices, new Random(seed));
+
+        int nTrain = (int) Math.round(n * train / 100.0);
+        int nVal   = (int) Math.round(n * val   / 100.0);
+        // Clamp so nTrain + nVal <= n (rounding edge case)
+        if (nTrain + nVal > n) nVal = n - nTrain;
+
+        String[] labels = new String[n];
+        for (int i = 0; i < n; i++) {
+            int idx = indices.get(i);
+            if      (i < nTrain)         labels[idx] = "training";
+            else if (i < nTrain + nVal)  labels[idx] = "validation";
+            else                         labels[idx] = "test";
+        }
+
+        // Ensure the column exists in the table
+        if (!tableHasColumn(table, colName))
+            addTableColumn(table, colName, context);
+
+        // Build undoable batch
+        MetadataEdit batchEdit = new MetadataEdit();
+        for (int i = 0; i < n; i++) {
+            ImageEntryWrapper w = visibleEntries.get(i);
+            String oldVal = w.getMetadataValue(colName);
+            String newVal = labels[i];
+            if (!newVal.equals(oldVal))
+                batchEdit.addChange(w, colName, oldVal, newVal);
+        }
+        if (!batchEdit.isEmpty())
+            context.execute(batchEdit);
+
+        Dialogs.showInfoNotification("Train/val/test split",
+                "Assigned split to " + n + " images in column \u201c" + colName + "\u201d\n"
+                + "  training: " + nTrain + "  validation: " + nVal
+                + "  test: " + (n - nTrain - nVal));
+    }
+
+        /**
      * Populates {@code PathName} and {@code FileName} metadata columns from each
      * entry's first URI, using CellProfiler naming conventions.
      * <p>
