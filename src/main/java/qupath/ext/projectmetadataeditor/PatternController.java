@@ -366,6 +366,7 @@ public class PatternController extends BorderPane {
             .code-area {
                 -fx-font-family: 'Consolas', 'Monaco', monospace;
                 -fx-font-size: 12px;
+                -fx-background-color: -fx-control-inner-background;
             }
             .code-area .regex-syntax {
                 -fx-fill: #808080;
@@ -380,7 +381,7 @@ public class PatternController extends BorderPane {
                 -fx-font-weight: bold;
             }
             .code-area .plain {
-                -fx-fill: #000000;
+                -fx-fill: -fx-text-inner-color;
             }
             .code-area .group-color-1 {
                 -fx-fill: #22c55e;
@@ -449,7 +450,10 @@ public class PatternController extends BorderPane {
                     int end = matcher.end(i);
                     if (start >= 0) {
                         if (start > lastEnd) {
-                            textFlow.getChildren().add(new Text(value.substring(lastEnd, start)));
+                            //textFlow.getChildren().add(new Text(value.substring(lastEnd, start)));
+                            Text plainText = new Text(value.substring(lastEnd, start));
+                            plainText.setStyle("-fx-fill: -fx-text-background-color;");
+                            textFlow.getChildren().add(plainText);
                         }
                         Text groupText = new Text(value.substring(start, end));
                         groupText.setStyle("-fx-fill: " + getHexColorForGroup(i - 1) + "; -fx-font-weight: bold;");
@@ -458,10 +462,16 @@ public class PatternController extends BorderPane {
                     }
                 }
                 if (lastEnd < value.length()) {
-                    textFlow.getChildren().add(new Text(value.substring(lastEnd)));
+                    //textFlow.getChildren().add(new Text(value.substring(lastEnd)));
+                    Text plainText = new Text(value.substring(lastEnd));
+                    plainText.setStyle("-fx-fill: -fx-text-background-color;");
+                    textFlow.getChildren().add(plainText);
                 }
             } else {
-                textFlow.getChildren().add(new Text(value));
+                //textFlow.getChildren().add(new Text(value));
+                Text plainText = new Text(value);
+                plainText.setStyle("-fx-fill: -fx-text-background-color;");
+                textFlow.getChildren().add(plainText);
             }
             
             setGraphic(textFlow);
