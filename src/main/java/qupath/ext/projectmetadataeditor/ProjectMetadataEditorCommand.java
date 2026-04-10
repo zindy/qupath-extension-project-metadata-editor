@@ -249,6 +249,10 @@ public class ProjectMetadataEditorCommand {
 
         MenuItem miAddPathFileCols = new MenuItem("Add PathName \u0026 FileName columns");
 
+        MenuItem miPattern = new MenuItem("Extract metadata from pattern...");
+        miPattern.setOnAction(e -> showPatternDialog(table, context));
+        menuEdit.getItems().add(miPattern);
+
         MenuItem miAssignSplit = new MenuItem("Assign train/validation/test split\u2026");
         miAssignSplit.setOnAction(e -> assignTrainValTestSplit(table, entries, context));
         miAddPathFileCols.setOnAction(e -> addPathNameFileNameColumns(table, entries, context));
@@ -1207,6 +1211,25 @@ public class ProjectMetadataEditorCommand {
                 + "  test: " + (n - nTrain - nVal));
     }
 
+    private static void showPatternDialog(TableView<ImageEntryWrapper> table, EditorContext context) {
+        // Get all current metadata column names (excluding fixed columns)
+        List<String> availableColumns = new ArrayList<>();
+        for (TableColumn<ImageEntryWrapper, ?> col : table.getColumns()) {
+            String colName = col.getText();
+            if (!INDEX.equals(colName)) {  //&& !IMAGE_NAME.equals(colName)) {
+                availableColumns.add(colName);
+            }
+        }
+        
+        if (availableColumns.isEmpty()) {
+            Dialogs.showWarningNotification("No Columns", 
+                "No metadata columns available. Add some columns first.");
+            return;
+        }
+        
+        PatternController.showPatternDialog(table.getItems(), availableColumns, context);
+    }
+
         /**
      * Populates {@code PathName} and {@code FileName} metadata columns from each
      * entry's first URI, using CellProfiler naming conventions.
@@ -1336,7 +1359,7 @@ public class ProjectMetadataEditorCommand {
      * renamed (redo) or a rename is undone, so the column always reads from and
      * writes to the correct key.
      */
-    private static void bindColumnToKey(TableColumn<ImageEntryWrapper, String> col,
+    static void bindColumnToKey(TableColumn<ImageEntryWrapper, String> col,
                                          String key,
                                          EditorContext context) {
         col.setCellValueFactory(v -> v.getValue().getProperty(key));
@@ -1351,12 +1374,18 @@ public class ProjectMetadataEditorCommand {
         });
     }
 
+    static TableColumn<ImageEntryWrapper, String> createMetadataColumn(String columnName) {
+        TableColumn<ImageEntryWrapper, String> col = new TableColumn<>(columnName);
+        col.setEditable(true);
+        col.setSortable(true);
+        col.setCellFactory(TextFieldTableCell.forTableColumn());
+        return col;
+    }
+
     private static void addTableColumn(TableView<ImageEntryWrapper> table,
                                         String metadataName,
                                         EditorContext context) {
-        TableColumn<ImageEntryWrapper, String> col = new TableColumn<>(metadataName);
-        col.setCellFactory(TextFieldTableCell.forTableColumn());
-        col.setEditable(true);
+        TableColumn<ImageEntryWrapper, String> col = createMetadataColumn(metadataName);
         bindColumnToKey(col, metadataName, context);
         table.getColumns().add(col);
     }
@@ -1756,12 +1785,12 @@ public class ProjectMetadataEditorCommand {
      * {@link ColumnRenameEdit}, {@link ColumnCopyEdit}, and {@link ColumnRemoveEdit}
      * handle column-level structural changes (header + data together).
      */
-    private interface UndoableEdit {
+    public interface UndoableEdit {
         void undo();
         void redo();
     }
 
-    private static class EditorContext {
+    public static class EditorContext {
         final Stack<UndoableEdit> undoStack = new Stack<>();
         final Stack<UndoableEdit> redoStack = new Stack<>();
         final TableView<ImageEntryWrapper> table;
@@ -1773,6 +1802,10 @@ public class ProjectMetadataEditorCommand {
             this.miUndo = miUndo;
             this.miRedo = miRedo;
             updateMenuState();
+        }
+
+        public TableView<ImageEntryWrapper> getTable() {
+            return table;
         }
 
         void execute(UndoableEdit edit) {
@@ -2020,7 +2053,13 @@ public class ProjectMetadataEditorCommand {
             });
         }
 
-        public String getMetadataValue(Object key) { return metadataMap.get(key); }
+        public String getMetadataValue(Object key) {
+            // If the requested key is "Image Name", return the actual entry name
+            if (IMAGE_NAME.equals(key)) {
+                return entry.getImageName();
+            }
+            return metadataMap.get(key);
+        }
 
         public void putMetadataValue(String key, String value) { metadataMap.put(key, value); }
 

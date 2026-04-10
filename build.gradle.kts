@@ -33,6 +33,9 @@ dependencies {
     shadow(libs.bundles.logging)
     shadow(libs.qupath.fxtras)
 
+    // Add RichTextFX for CodeArea
+    implementation("org.fxmisc.richtext:richtextfx:0.11.2")
+
 
     // For testing
     testImplementation(libs.bundles.qupath)
